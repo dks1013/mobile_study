@@ -1,0 +1,593 @@
+================================================================================
+  com.skhy.store LIAPP v5.1.1.200 후킹 우회 분석 전체 기록
+  작성일: 2026-05-26
+  목적: 다음 세션에서 Claude가 이 파일을 읽고 바로 이어서 진행하기 위함
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. 기본 환경 정보
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+앱 패키지명  : com.skhy.store
+APK 파일     : A000SHY003_17781210497761001.apk
+LIAPP 버전   : v5.1.1.200 (모바일 보안 솔루션)
+기기         : Samsung SM-N960N (Galaxy Note 9)
+Android 버전 : 10 (Q, Android 10)
+작업 디렉토리: C:\Users\dks10\Desktop\store_new\
+핵심 스크립트: C:\Users\dks10\Desktop\store_new\bypass_skhy_store.js
+분석 도구    : Frida (USB 연결), IDA Pro (ARM64 모드)
+
+중요 제약사항: 패치 금지. 후킹(Hooking)만 허용.
+
+실행 명령어:
+  frida -U -f com.skhy.store -l bypass_skhy_store.js --no-pause
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. APK 및 libzwfeyyadt.so 구조 분석
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[APK 내 핵심 라이브러리]
+  /lib/arm64-v8a/libzwfeyyadt.so  -- LIAPP 보안 엔진 (642KB, ARM64)
+  /lib/arm64-v8a/libsqlcipher.so  -- SQLite 암호화 (앱 DB)
+
+[libzwfeyyadt.so ELF 구조]
+  - 섹션 헤더 모두 size=1 → 안티분석용 조작
+  - PT_LOAD 세그먼트: 코드 0x0 ~ 0x9D418 / 데이터 0x9E838+
+  - exports: start(0x9C80), std::logic_error::~logic_error()(0x51B70), vtable(0xA3440)
+    → JNI_OnLoad 없음! 초기화는 start를 직접 호출하는 방식
+  - .lisec.dynamic 섹션 = 커스텀 암호화 섹션
+    내부 구조: ZIP 파일 (magic: 0x04034B50) → zlib inflate → libliapp.so
+    ZIP 안에 libliapp.so가 AES-128-CBC로 추가 암호화되어 있음
+
+[libliapp.so (in-memory)]
+  - libzwfeyyadt.so base + 0x7f000 위치에 런타임 복호화 후 메모리 로드
+  - 크래시 로그에 "libzwfeyyadt.so!libliapp.so (offset 0x7f000)"으로 표시됨
+  - LIAPP의 실제 탐지 로직 포함
+
+[LIAPP DEX 파일]
+  - 런타임에 /data/user/0/com.skhy.store/files/.d7f6d151/5167a360/۬ۯ٩.jar 에 추출
+  - com.liapp.y, com.liapp.x 등 obfuscated 클래스 포함
+  - SSMInstallProvider ContentProvider 초기화 시 로드됨
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. IDA Pro 분석으로 확정된 핵심 함수 오프셋 (libzwfeyyadt.so 기준)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+오프셋      함수명         역할
+────────────────────────────────────────────────────────────────────────────────
+0x7DFD0  │ byte_7DFD0  │ 모든 감지 이벤트 중앙 디스패처
+         │             │   시그니처: void fn(int event_code, int param, char* msg)
+         │             │   param==1 또는 16 또는 32: sub_9650(buf,0,&sub_385FC,&ec) 호출
+         │             │   이후 sub_11690(event_code) → Java 핸들러 디스패치
+         │             │   IDA bad_offset 문제: 0x7DFD0 바이트(0xFF)가 별도 세그먼트
+         │             │   실제 ARM64 명령어: FF 07 40 D1 = SUB SP, SP, #0x1010
+         │             │   → Frida에서는 base.add(0x7DFD0) 그대로 사용 가능
+────────────────────────────────────────────────────────────────────────────────
+0x380C0  │ sub_380C0   │ 직접 SVC kill (libc 우회)
+         │             │   MOV X8, #0x81 (=129=SYS_kill) + SVC 0
+         │             │   libc kill() 훅을 우회하는 인라인 syscall
+         │             │   시그니처: int fn(int pid, int sig)
+────────────────────────────────────────────────────────────────────────────────
+0xF9B0   │ sub_F9B0    │ 메모리 읽기 유틸리티
+         │             │   시그니처: int64 fn(pointer dst, int64 src, int size)
+         │             │   src에서 size 바이트를 dst로 복사
+         │             │   libliapp.so가 JIT 코드 페이지를 읽을 때 사용
+         │             │   Android 10 XOM(Execute-Only Memory)으로 SIGSEGV 발생
+────────────────────────────────────────────────────────────────────────────────
+0x28CE4  │ sub_28CE4   │ 화이트스크린 트리거
+         │             │   내부에서 byte_7DFD0(1059, 16, message) 호출
+         │             │   dword_A420C, dword_A5C80, dword_A4AE8 플래그 체크
+         │             │   sub_1827C() 조건 검사 후 실행
+────────────────────────────────────────────────────────────────────────────────
+0x385FC  │ sub_385FC   │ APK CRC-32 검사
+         │             │   sub_FBEC()로 CRC 계산, dword_A4088과 비교
+         │             │   실패 시 byte_7DFD0(1120, 32, message) 호출
+         │             │   시그니처: int64 fn(int64 a1)
+────────────────────────────────────────────────────────────────────────────────
+0x383D8  │ sub_383D8   │ kill 보조 디스패처 (의심)
+         │             │   sub_385FC 내에서 sub_383D8(18) 호출됨
+         │             │   시그니처: void fn(int64 a1)
+────────────────────────────────────────────────────────────────────────────────
+0x2A474  │ sub_2A474   │ APK 스캐너 + 설정 파서
+         │             │   APK ZIP 열기, CSV 형식 데이터 파싱
+         │             │   패키지명 체크, 감지 플래그 설정
+         │             │   dword_A42A8, dword_A5D94, dword_A5D10, qword_A5D08 설정
+         │             │   byte_7DFD0(2010, ...) 및 byte_7DFD0(2026, ...) 호출
+         │             │   ※ LIAPP dex 초기화 코드도 포함 → 완전 차단 금지
+────────────────────────────────────────────────────────────────────────────────
+0x7E404  │ sub_7E404   │ APK 무결성 검사 (메인)
+         │             │   모드 기반: 1=전체검사, 2=보조검사, 3=라이브러리로드
+         │             │   AES-128-CBC로 내장 설정 복호화
+         │             │   이벤트: 7012-7014, 8005-8010, 8022, 8023, 8901, 9001, 9002
+         │             │   ※ LIAPP dex 초기화 코드도 포함 → 완전 차단 금지
+────────────────────────────────────────────────────────────────────────────────
+0xB1D8   │ sub_B1D8    │ zlib inflate 구현 (전체 상태머신 case 0-9)
+         │             │   CMF 바이트 체크(& 0xF == 8), 헤더 체크섬(% 31)
+         │             │   32KB 윈도우, 288/19 Huffman 테이블
+────────────────────────────────────────────────────────────────────────────────
+0x1BF28  │ sub_1BF28   │ ZIP 파서/추출기
+         │             │   Central Directory 순회, 파일명으로 추출
+         │             │   압축된 경우 sub_B1D8 호출
+────────────────────────────────────────────────────────────────────────────────
+0x9C80   │ start       │ export 함수 (JNI_OnLoad 아님)
+         │             │   버퍼 리더 유틸, sub_B1D8에서 호출됨
+────────────────────────────────────────────────────────────────────────────────
+0xFBEC   │ sub_FBEC    │ CRC-32 계산 함수
+         │             │   sub_385FC에서 APK 파일 CRC 계산에 사용
+────────────────────────────────────────────────────────────────────────────────
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. byte_7DFD0 이벤트 코드 목록
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+이벤트 코드  의미                         출처
+────────────────────────────────────────────────────────────
+1059        화이트스크린 표시              sub_28CE4
+1065        미확인 (초기화 관련 가능성)    미상
+1082        미확인 (초기화 관련 가능성)    미상
+1120        APK CRC 불일치                 sub_385FC
+2010        패키지/설정 감지               sub_2A474
+2026        패키지/설정 감지               sub_2A474
+7012        라이브러리 감지                sub_7E404
+7013        라이브러리 감지                sub_7E404
+7014        라이브러리 감지                sub_7E404
+7017        미확인                         미상
+7018        미확인                         미상
+8005~8010   ZIP 엔트리 무결성              sub_7E404
+8022        ZIP 엔트리 무결성              sub_7E404
+8023        ZIP 엔트리 무결성              sub_7E404
+8901        기타                           sub_7E404
+9001        기타                           sub_7E404
+9002        기타                           sub_7E404
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. libzwfeyyadt.so 탐지 방법 (Frida)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+중요: Process.findModuleByName("libzwfeyyadt.so") 로는 찾히지 않는다!
+이유: Android 10에서 System.loadLibrary가 표준 dlopen export를 거치지 않는 경로로 로드.
+
+해결책: Process.enumerateRanges({protection:'r-x'}) 로 모든 실행 가능 메모리 범위를 순회하고
+         r.file.path에 "zwfeyyadt" 또는 "liapp"이 포함된 것을 찾는다.
+
+성공 로그 예시:
+  [SCAN] /data/app/com.skhy.store-lijC-u5lw62KNGAhgCw0lA==/lib/arm64/libzwfeyyadt.so @ 0x767fcd1000
+
+런타임 base 주소: 매 실행마다 ASLR로 변경됨 (예: 0x767fcd1000, 0x767ddcf000 등)
+훅 주소 계산: base + offset (예: byte_7DFD0 = base + 0x7DFD0)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. 발견된 LIAPP 탐지/응답 메커니즘
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[탐지 흐름]
+  감지 함수들 (sub_28CE4, sub_2A474, sub_7E404, sub_385FC)
+    → byte_7DFD0(event_code, param, message) 호출
+      → param==1/16/32: sub_9650를 통해 sub_385FC 호출 (CRC 추가 검사)
+      → sub_11690(event_code): Java 핸들러 테이블 조회
+        → 핸들러 있으면 Java JNI 호출 → 화면 표시/앱 종료
+
+[응답 메커니즘 (확인된 것)]
+  1. 화이트스크린 표시: byte_7DFD0(1059, ...) → Java LiappAlert 또는 Activity
+  2. 앱 프로세스 직접 kill:
+     a. sub_380C0(pid, SIGKILL): MOV X8,#129 + SVC 0 (libc 완전 우회)
+     b. libc kill(pid, 9): 표준 경로 (libc 훅으로 차단 가능)
+     c. Java: Process.killProcess(pid) (Java 훅으로 차단 가능)
+     d. Java: System.exit(code) (Java 훅으로 차단 가능)
+  3. 앱 백그라운드 전환: byte_7DFD0 내부 Java 핸들러가 Activity.moveTaskToBack() 또는 finish() 호출
+  4. SIGALRM (signal 14): sub_380C0(0, 14) 로 전체 프로세스 그룹에 알람 신호
+     → LIAPP 워치독 타이머로 사용 (완전 차단 시 문제 발생 가능)
+
+[LIAPP 무결성 체크]
+  byte_7DFD0 함수 자체에 대한 무결성 검사 존재
+  → byte_7DFD0를 Interceptor.replace 하면 LIAPP가 이를 감지
+  → sub_380C0(getpid(), SIGKILL)로 프로세스 즉시 종료 시도
+  해결책: sub_380C0를 먼저 차단한 뒤 byte_7DFD0 훅 적용
+
+[Android 10 XOM (Execute-Only Memory) 문제]
+  증상: Process crashed: Bad access due to protection failure (SIGSEGV, SEGV_ACCERR)
+  크래시 스택:
+    com.liapp.y.function (dex @ .d7f6d151/.../۬ۯ٩.jar)
+    → com.liapp.x.function
+    → libliapp.so:0x84778 (libzwfeyyadt.so!libliapp.so offset 0x7f000)
+    → libzwfeyyadt.so:0xF9C0 (sub_F9B0 + 0x10)
+    fault addr: 0x7697f33ba0 (JIT 코드 페이지)
+  원인: Android 10에서 ART JIT 코드 페이지가 PROT_EXEC only (읽기 권한 없음)
+        LIAPP sub_F9B0가 JIT 코드 주소에서 바이트 읽기 시도 → SEGV_ACCERR
+  해결책: sub_F9B0 훅 → mprotect로 PROT_READ 추가 후 읽기 시도
+
+[sub_2A474 및 sub_7E404 완전 차단 금지]
+  이유: LIAPP dex 초기화 코드 포함
+  완전 차단 시 발생하는 오류:
+    java.lang.NoClassDefFoundError: Failed resolution of: Lcom/liapp/y;
+    at net.sqlcipher.database.SQLiteDatabase$1.loadLibraries
+    at com.skhy.store.login.provider.AuthProvider.onCreate
+  해결책: 이 함수들은 실행시키되, byte_7DFD0 no-op으로 이벤트만 차단
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. 시도한 것들과 결과 타임라인
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 1: Java 레이어 훅만 시도
+  → 결과: 흰화면 지속. Java 훅이 잘못된 ClassLoader를 사용하거나 이미 늦은 시점에 실행됨
+
+Step 2: IDA로 libzwfeyyadt.so 분석 시작
+  → sub_B1D8 = zlib inflate 확인
+  → sub_1BF28 = ZIP 파서 확인
+  → sub_7E404 = AES-128-CBC + 무결성 검사 확인
+  → byte_7DFD0 = 중앙 이벤트 디스패처 확인
+  → sub_28CE4 = 화이트스크린 트리거 확인
+  → sub_385FC = APK CRC 검사 확인
+
+Step 3: byte_7DFD0 + sub_28CE4 + sub_385FC 훅 적용
+  → 흰화면 해결!
+  → 그러나 Process terminated 발생
+  → byte_7DFD0 교체 시 LIAPP 무결성 체크 발동
+
+Step 4: IDA에서 SVC 명령어 검색 (01 00 00 D4)
+  → sub_380C0 발견: MOV X8, #0x81(=SYS_kill) + SVC 0
+  → libc kill 함수를 완전히 우회하는 인라인 syscall 확인
+
+Step 5: sub_380C0 차단 추가
+  → sub_380C0(pid, SIGKILL) 5회 차단 성공
+  → 앱이 백그라운드로 내려가는 현상 발생
+  → byte_7DFD0 ATTACH(로깅)만 했을 때 event=1120이 발생하고 Java 핸들러가 백그라운드 전환
+
+Step 6: byte_7DFD0를 REPLACE no-op으로 교체
+  → 백그라운드 전환 해결
+  → java.lang.ClassNotFoundException: com.liapp.y 발생
+  → 원인: sub_7E404 완전 차단으로 LIAPP dex 초기화 실패
+
+Step 7: sub_7E404, sub_2A474 차단 제거
+  → ClassNotFoundException 해결
+  → Process crashed: SIGSEGV SEGV_ACCERR at sub_F9B0 (0xF9C0)
+  → 원인: libliapp.so가 JIT 코드 페이지를 읽으려다 Android 10 XOM 권한 오류
+
+Step 8: sub_F9B0 mprotect 훅 추가 (현재 상태)
+  → 아직 테스트 결과 없음 → 다음 세션에서 실행 필요
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. 현재 bypass_skhy_store.js 훅 구성 (최종 상태)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[Layer 1: 프로세스 생존]
+  - libc exit/_exit/abort → NativeCallback no-op
+  - libc kill/tgkill/tkill/pthread_kill → SIGKILL(9)/SIGABRT(6)/SIGSTOP(19) 차단
+  - libc raise → no-op
+  - libc syscall → exit_group(93/94) 차단, kill syscall sig 9/6 차단
+  - libc fork → 항상 -1 반환 (watchdog 방지)
+
+[Layer 2: Frida 탐지 우회]
+  - libc fgets → /proc/self/maps에서 frida/gum-js/gmain/gdbus/linjector 문자열 은닉
+                 TracerPid 값 0으로 조작
+  - libc dl_iterate_phdr → frida/gadget/gum-js/linjector 모듈 숨김
+
+[Layer 3: libzwfeyyadt.so 핵심 훅 (hookZwf 함수)]
+  탐지 시점: Java.perform 콜백 또는 setInterval 50ms 폴링으로 라이브러리 로드 감지
+
+  훅 1: byte_7DFD0 @ 0x7DFD0
+    → Interceptor.replace, void(int,int,pointer), 완전 no-op
+    → 모든 감지 이벤트 차단
+    → 로그: "[ZWF] byte_7DFD0 BLOCKED event=X param=Y"
+
+  훅 2: sub_380C0 @ 0x380C0
+    → Interceptor.replace, int(int,int)
+    → SIGKILL(9)/SIGABRT(6)/SIGSTOP(19)만 차단
+    → 나머지 신호(SIGALRM=14 등)는 libc kill로 포워딩
+    → 로그: "[ZWF] sub_380C0(pid,sig) KILL BLOCKED"
+
+  훅 3: sub_F9B0 @ 0xF9B0  ← 최신 추가, 아직 테스트 안됨
+    → Interceptor.replace, int64(pointer,int64,int)
+    → mprotect(pageBase, 4096, PROT_READ|PROT_EXEC=5) 호출 후 읽기
+    → 실패 시 0 반환 (크래시 방지)
+    → 로그: "[ZWF] sub_F9B0: bad read @ 0x..." (실패 시)
+
+  Java 훅:
+    - android.os.Process.killProcess → no-op
+    - java.lang.System.exit → no-op
+    - com.init.LiappAlert.showAlertDisplay → no-op (여러 클래스명 시도)
+
+[라이브러리 탐지 방법]
+  - scanRangesForZwf(): r-x 범위 순회, file.path에 "zwf"/"liapp" 포함 시 훅
+  - hookRegisterNatives(): JNIEnv vtable[215] 훅, fnPtr으로 모듈 역산
+  - setInterval 50ms 폴링, 최대 15초 (400 tick)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. 현재 bypass_skhy_store.js 전체 코드
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/**
+ * com.skhy.store - LIAPP bypass
+ * frida -U -f com.skhy.store -l bypass_skhy_store.js --no-pause
+ */
+'use strict';
+
+// ── 1. 프로세스 생존 ──
+["exit","_exit","abort"].forEach(function(n){
+    var f=Module.findExportByName("libc.so",n);
+    if(f) Interceptor.replace(f,new NativeCallback(function(){},'void',['int']));
+});
+["kill","tgkill","tkill","pthread_kill"].forEach(function(n){
+    var f=Module.findExportByName("libc.so",n);
+    if(!f) return;
+    Interceptor.attach(f,{onEnter:function(a){
+        var i=(n==="kill"||n==="pthread_kill")?1:2;
+        var s=a[i].toInt32();
+        if(s===9||s===6||s===19) a[i]=ptr(0);
+    }});
+});
+(function(){
+    var f=Module.findExportByName("libc.so","raise");
+    if(f) Interceptor.replace(f,new NativeCallback(function(){return 0;},'int',['int']));
+    var sc=Module.findExportByName("libc.so","syscall");
+    if(sc) Interceptor.attach(sc,{onEnter:function(a){
+        var n=a[0].toInt32();
+        if(n===93||n===94){a[0]=ptr(35);return;}
+        if(n===129||n===130||n===131){var s=a[2].toInt32();if(s===9||s===6)a[2]=ptr(0);}
+    }});
+    var fk=Module.findExportByName("libc.so","fork");
+    if(fk) Interceptor.replace(fk,new NativeCallback(function(){return -1;},'int',[]));
+})();
+console.log("[*] survive OK");
+
+// ── 2. /proc 은닉 ──
+(function(){
+    var HIDE=["frida","gum-js","gmain","gdbus","linjector"];
+    var f=Module.findExportByName("libc.so","fgets");
+    if(!f) return;
+    Interceptor.attach(f,{
+        onEnter:function(a){this.buf=a[0];},
+        onLeave:function(r){
+            if(r.isNull()) return;
+            try{
+                var line=Memory.readUtf8String(this.buf);
+                if(!line) return;
+                var lo=line.toLowerCase();
+                if(HIDE.some(function(s){return lo.indexOf(s)!==-1;}))
+                    Memory.writeUtf8String(this.buf,"\n");
+                else if(lo.indexOf("tracerpid:")===0&&lo.indexOf("tracerpid:\t0")===-1)
+                    Memory.writeUtf8String(this.buf,"TracerPid:\t0\n");
+            }catch(e){}
+        }
+    });
+    var dip=Module.findExportByName("libc.so","dl_iterate_phdr");
+    if(!dip) return;
+    var _cbs=[];
+    Interceptor.attach(dip,{onEnter:function(args){
+        var orig=args[0];
+        if(orig.isNull()) return;
+        var origFn=new NativeFunction(orig,'int',['pointer','uint64','pointer']);
+        var w=new NativeCallback(function(info,sz,data){
+            try{
+                var np=Memory.readPointer(info.add(8));
+                if(!np.isNull()){
+                    var nm=Memory.readCString(np).toLowerCase();
+                    if(["frida","gadget","gum-js","linjector"].some(function(s){return nm.indexOf(s)!==-1;})) return 0;
+                }
+            }catch(e){}
+            return origFn(info,sz,data);
+        },'int',['pointer','uint64','pointer']);
+        _cbs.push(w); args[0]=w;
+    }});
+})();
+console.log("[*] anti-detect OK");
+
+// ── 3. libzwfeyyadt.so 훅 핵심 ──
+var _zwfDone=false;
+function hookZwf(base){
+    if(_zwfDone) return;
+    _zwfDone=true;
+    console.log("[ZWF] base="+base);
+
+    try{
+        Interceptor.replace(base.add(0x7DFD0),
+            new NativeCallback(function(code,param,msg){
+                console.log("[ZWF] byte_7DFD0 BLOCKED event="+code+" param="+param);
+            },'void',['int','int','pointer']));
+        console.log("[ZWF] byte_7DFD0 REPLACE OK");
+    }catch(e){console.log("[ZWF] byte_7DFD0 FAIL: "+e.message);}
+
+    try{
+        const libcKill=new NativeFunction(
+            Module.findExportByName("libc.so","kill"),'int',['int','int']);
+        Interceptor.replace(base.add(0x380C0),
+            new NativeCallback(function(pid,sig){
+                if(sig===9||sig===6||sig===19){
+                    console.log("[ZWF] sub_380C0("+pid+","+sig+") KILL BLOCKED");
+                    return 0;
+                }
+                return libcKill(pid,sig);
+            },'int',['int','int']));
+        console.log("[ZWF] sub_380C0 OK");
+    }catch(e){console.log("[ZWF] sub_380C0 FAIL: "+e.message);}
+
+    try{
+        const mprotectFn=new NativeFunction(
+            Module.findExportByName("libc.so","mprotect"),'int',['pointer','size_t','int']);
+        Interceptor.replace(base.add(0xF9B0),
+            new NativeCallback(function(dst,src,size){
+                try{
+                    const PAGE=4096;
+                    const pageBase=src.and(ptr("0xFFFFFFFFFFFFF000"));
+                    mprotectFn(pageBase,PAGE,5);
+                    const bytes=Memory.readByteArray(src,size);
+                    if(bytes&&!dst.isNull())
+                        Memory.writeByteArray(dst,new Uint8Array(bytes));
+                    return src;
+                }catch(e2){
+                    console.log("[ZWF] sub_F9B0: bad read @ "+src+" ("+e2.message+")");
+                    return 0;
+                }
+            },'int64',['pointer','int64','int']));
+        console.log("[ZWF] sub_F9B0 OK");
+    }catch(e){console.log("[ZWF] sub_F9B0 FAIL: "+e.message);}
+
+    Java.perform(function(){
+        try{
+            var P=Java.use("android.os.Process");
+            P.killProcess.implementation=function(pid){
+                console.log("[Java] Process.killProcess("+pid+") BLOCKED");
+            };
+        }catch(e){}
+        try{
+            var S=Java.use("java.lang.System");
+            S.exit.implementation=function(c){
+                console.log("[Java] System.exit("+c+") BLOCKED");
+            };
+        }catch(e){}
+    });
+}
+
+function scanRangesForZwf(){
+    var found=false;
+    Process.enumerateRanges({protection:'r-x',coalesce:true}).forEach(function(r){
+        if(!r.file) return;
+        var p=r.file.path||"";
+        if(p.toLowerCase().indexOf("zwf")!==-1||p.toLowerCase().indexOf("liapp")!==-1){
+            console.log("[SCAN] "+p+" @ "+r.base);
+            hookZwf(r.base);
+            found=true;
+        }
+    });
+    return found;
+}
+
+function hookRegisterNatives(){
+    try{
+        var env=Java.vm.getEnv();
+        var vtable=Memory.readPointer(env.handle);
+        var regNativesPtr=Memory.readPointer(vtable.add(215*8));
+        console.log("[RN] RegisterNatives @ "+regNativesPtr);
+        Interceptor.attach(regNativesPtr,{onEnter:function(args){
+            var count=args[3].toInt32();
+            for(var i=0;i<count;i++){
+                try{
+                    var entry=args[2].add(i*24);
+                    var nm=Memory.readCString(Memory.readPointer(entry));
+                    var fnPtr=Memory.readPointer(entry.add(16));
+                    var mod=Process.findModuleByAddress(fnPtr);
+                    console.log("[RN] "+nm+" fnPtr="+fnPtr+" mod="+(mod?mod.name+" base="+mod.base:"ANON"));
+                    if(mod){
+                        if(mod.name.indexOf("zwf")!==-1||mod.name.indexOf("liapp")!==-1||mod.name.indexOf("guard")!==-1)
+                            hookZwf(mod.base);
+                    } else {
+                        var scan=fnPtr.and(ptr("0xFFFFF000"));
+                        for(var off=0;off<0x800000;off+=0x1000){
+                            try{
+                                var b=Memory.readByteArray(scan.sub(off),4);
+                                var a=new Uint8Array(b);
+                                if(a[0]===0x7F&&a[1]===0x45&&a[2]===0x4C&&a[3]===0x46){
+                                    hookZwf(scan.sub(off));
+                                    break;
+                                }
+                            }catch(e){break;}
+                        }
+                    }
+                }catch(e){}
+            }
+        }});
+    }catch(e){console.log("[RN] hook fail: "+e.message);}
+}
+
+var _tick=0;
+var _timer=setInterval(function(){
+    if(_zwfDone){clearInterval(_timer);return;}
+    if(scanRangesForZwf()){clearInterval(_timer);return;}
+    if(_tick===60){
+        console.log("[DUMP] All non-system modules:");
+        Process.enumerateModules().forEach(function(m){
+            if(m.name.indexOf("android")===-1&&m.name.indexOf("libart")===-1&&
+               m.name.indexOf("libc.")===-1&&m.name.indexOf("libm.")===-1&&
+               m.name.indexOf("libdl")===-1&&m.name.indexOf("libz.")===-1&&
+               m.name.indexOf("libstdc")===-1)
+                console.log("[DUMP]   "+m.name+" @ "+m.base);
+        });
+    }
+    if(++_tick>400) clearInterval(_timer);
+},50);
+
+Java.perform(function(){
+    scanRangesForZwf();
+    hookRegisterNatives();
+    ["com.init.LiappAlert","com.nshc.SecureZone.LiappAlert","com.nshc.liapp.LiappAlert"].forEach(function(cn){
+        try{
+            var cls=Java.use(cn);
+            cls.showAlertDisplay.overloads.forEach(function(ov){
+                ov.implementation=function(){console.log("[Java] "+cn+".showAlertDisplay BLOCKED");};
+            });
+            console.log("[Java] "+cn+" hooked");
+        }catch(e){}
+    });
+});
+
+console.log("[*] script loaded");
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. 현재 상태 및 다음에 해야 할 것
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[현재 상태]
+  ✅ 흰화면 차단 완료 (byte_7DFD0 no-op)
+  ✅ Process terminated 차단 완료 (sub_380C0 inline kill 차단)
+  ✅ 앱 백그라운드 전환 차단 완료 (byte_7DFD0 no-op)
+  ✅ com.liapp.y ClassNotFoundException 해결 (sub_7E404/sub_2A474 차단 제거)
+  ⏳ SIGSEGV SEGV_ACCERR at sub_F9B0 → mprotect 훅 추가 완료, 아직 테스트 미진행
+
+[다음 세션에서 할 일]
+  1. 현재 스크립트 실행:
+       frida -U -f com.skhy.store -l bypass_skhy_store.js --no-pause
+
+  2. sub_F9B0 mprotect 훅이 크래시를 해결하는지 확인
+
+  3. 만약 sub_F9B0 mprotect 실패 시 (mprotect가 sealed 메모리에 거부될 경우):
+     - sub_F9B0 완전 no-op으로 교체: return 0
+     - 이후 다른 크래시 발생 여부 확인
+
+  4. 만약 mprotect 성공 후 새로운 문제 발생 시:
+     - 로그 분석하여 다음 단계 결정
+     - 새로운 이벤트 코드가 로그에 나타나면 byte_7DFD0에서 그 코드가 차단되는지 확인
+
+  5. 앱이 정상 실행되면 확인할 것:
+     - 실제 앱 컨텐츠 (상품 목록, 로그인 화면 등)가 표시되는지
+     - 네트워크 통신이 정상인지
+     - DB(SQLCipher) 접근이 정상인지
+
+[알려진 미해결 과제]
+  - sub_380C0 외에 다른 직접 SVC 패턴 있을 수 있음 (IDA에서 추가 검색 필요)
+    검색법: IDA → Search → Sequence of bytes → 01 00 00 D4
+    확인할 syscall 번호: X8=93(exit), X8=94(exit_group), X8=129(kill), X8=130(tkill), X8=131(tgkill)
+
+  - byte_7DFD0가 완전 no-op이라 내부 상태 업데이트가 안 될 수 있음
+    → 일부 초기화 이벤트(1082, 1065 등)도 차단됨
+    → 필요하다면 선택적 차단으로 변경 고려
+
+  - 앱이 살아남은 상태에서도 LIAPP이 주기적으로 재탐지를 시도할 수 있음
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11. 기타 파일 목록
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+C:\Users\dks10\Desktop\store_new\
+  bypass_skhy_store.js        ← 메인 Frida 스크립트 (현재 버전)
+  dump_liapp_runtime.js       ← LIAPP 런타임 메모리 덤프 스크립트 (참고용)
+  diag_skhy.js                ← 진단 스크립트 (참고용)
+  A000SHY003_17781210497761001\ ← 압축 해제된 APK 내용물
+    AndroidManifest.xml
+    lib\arm64-v8a\
+      libzwfeyyadt.so         ← IDA 분석 대상 (반드시 IDA에서 열어서 작업)
+      libsqlcipher.so
+  진행기록.txt                ← 이 파일
+
+================================================================================
+  END OF RECORD
+================================================================================
